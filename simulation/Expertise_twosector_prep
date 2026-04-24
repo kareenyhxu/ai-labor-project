@@ -1,0 +1,274 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrowPatch
+from scipy.optimize import root
+from params import Lbar, Kbar, lam, theta, eta, phi_list, I_grid
+
+# =========================================================
+# 1. Discretize phi-space
+# =========================================================
+NPHI = 200
+phi_grid = np.linspace(1e-4, 1.0 - 1e-4, NPHI)
+dphi = phi_grid[1] - phi_grid[0]
+
+
+# =========================================================
+# 2. Model objects
+# =========================================================
+def alpha(phi, I):
+    return np.minimum(phi, I) / (theta * (1.0 - phi) + phi)
+
+
+def omega(phi):
+    """
+    Weighted CES aggregator. PDF
+    """
+    return 2.0 * phi
+
+
+def unit_cost(phi, I, w, r):
+    """
+    p(phi) = w(phi)^(1-alpha) * (r/eta)^alpha
+    """
+    a = alpha(phi, I)
+    return w ** (1.0 - a) * (r / eta) ** a
+
+
+def labor_demand(phi, I, Y, w, r):
+    """
+    L(phi) under weighted CES demand.
+    """
+    a = alpha(phi, I)
+    om = omega(phi) ** lam
+    p = unit_cost(phi, I, w, r)
+    return Y * om * (1.0 - a) / w * p ** (1.0 - lam)
+
+
+def capital_demand(phi, I, Y, w, r):
+    """
+    K(phi) under weighted CES demand.
+    """
+    a = alpha(phi, I)
+    om = omega(phi) ** lam
+    p = unit_cost(phi, I, w, r)
+    return Y * om * a / r * p ** (1.0 - lam)
+
+
+def numeraire_integrand(phi, I, w, r):
+    """
+    Integrand for:
+    1 = ∫ omega(phi)^lam * w(phi)^((1-alpha)(1-lam)) * (r/eta)^(alpha(1-lam)) dphi
+    """
+    a = alpha(phi, I)
+    om = omega(phi) ** lam
+    return om * w ** ((1.0 - a) * (1.0 - lam)) * (r / eta) ** (a * (1.0 - lam))
+
+
+# =========================================================
+# 3. Recover Y from numeraire condition
+# =========================================================
+def recover_Y_from_numeraire(I, w_vec, r):
+    """
+    With the current normalization, Y does not appear in equation (17).
+    So Y is recovered from labor or capital clearing, not directly here.
+    This function checks eq(17) residual only.
+    """
+    vals = numeraire_integrand(phi_grid, I, w_vec, r)
+    return np.sum(vals) * dphi
+
+
+def recover_Y_from_capital(I, w_vec, r):
+    """
+    From capital market clearing:
+        Kbar / Y = ∫ omega(phi)^lam * [alpha(phi)/r] * p(phi)^(1-lam) dphi
+    """
+    K_vals = capital_demand(phi_grid, I, Y=1.0, w=w_vec, r=r)
+    # Since K(phi) is linear in Y, demand at Y=1 gives coefficient on Y
+    coeff = np.sum(K_vals) * dphi
+    if coeff <= 0 or not np.isfinite(coeff):
+        raise RuntimeError("Invalid capital-demand coefficient while recovering Y.")
+    return Kbar / coeff
+
+
+# =========================================================
+# 4. Residual system
+# =========================================================
+def residuals_general(x, I):
+    """
+    Unknowns:
+        x = [r, w(phi_1), ..., w(phi_N)]
+    Equations:
+        - expert occupations (phi > I): L(phi) = Lbar   [one equation per expert grid point]
+        - pooled inexpert labor: integral_{phi <= I} L(phi) = I * Lbar
+        - capital market clearing
+        - numeraire condition
+    """
+    if not (0.0 < I < 1.0):
+        raise ValueError(f"I must be in (0,1), got {I}")
+
+    r = x[0]
+    w_vec = x[1:]
+
+    if len(w_vec) != len(phi_grid):
+        raise ValueError("Length mismatch between wage vector and phi_grid.")
+
+    if (r <= 0) or np.any(w_vec <= 0) or (not np.isfinite(x).all()):
+        return np.ones(len(x)) * 1e8
+
+    # Recover Y from capital clearing
+    try:
+        Y = recover_Y_from_capital(I, w_vec, r)
+    except RuntimeError:
+        return np.ones(len(x)) * 1e8
+
+    L_vec = labor_demand(phi_grid, I, Y, w_vec, r)
+
+    expert_mask = phi_grid > I
+    inexpert_mask = phi_grid <= I
+
+    res = []
+
+    # (A) Expert occupations: L(phi) = Lbar pointwise
+    res.extend(L_vec[expert_mask] - Lbar)
+
+    # (B) Inexpert pooled labor mass
+    pooled_inexpert_labor = np.sum(L_vec[inexpert_mask]) * dphi
+    res.append(pooled_inexpert_labor - I * Lbar)
+
+    # (C) Numeraire condition
+    eq17 = recover_Y_from_numeraire(I, w_vec, r) - 1.0
+    res.append(eq17)
+
+    # Need total number of equations = total number of unknowns
+    # Unknown count = 1 + NPHI
+    # Equation count = (# expert grid points) + 1 + 1
+    # So we also pin down inexpert wages by requiring no-arbitrage form:
+    # use monotone interpolation / smooth anchoring residuals inside inexpert region
+    #
+    # Minimal closure: require all inexpert wages to satisfy local labor-demand flatness
+    # around pooled region, i.e. equalize them to their own demand-implied average.
+    #
+    # Numerically, we impose:
+    #    w(phi_j) - c / [omega(phi_j)^lam]^(1/[1+(1-a)(lam-1)]) = 0
+    # for some common c absorbed by using the first inexpert wage as anchor.
+    #
+    # Simpler numerical closure:
+    #    all inexpert wages lie on a smooth proportional schedule to omega(phi)
+    #
+    # w(phi) = w0 * omega(phi)^(1/lam)
+    #
+    # This is not a theorem from the original paper; it is a practical closure.
+    #
+    if np.any(inexpert_mask):
+        idx_inexp = np.where(inexpert_mask)[0]
+        base_idx = idx_inexp[0]
+        w0 = w_vec[base_idx] / (omega(phi_grid[base_idx]) ** (1.0 / lam))
+
+        for j in idx_inexp[1:]:
+            res.append(w_vec[j] - w0 * omega(phi_grid[j]) ** (1.0 / lam))
+
+    return np.array(res)
+
+
+# =========================================================
+# 5. Solve equilibrium for each I
+# =========================================================
+def solve_equilibrium(I, guess):
+    sol = root(lambda z: residuals_general(z, I), x0=guess, method="hybr")
+
+    if (not sol.success) or (not np.isfinite(sol.x).all()):
+        raise RuntimeError(f"Solver failed at I={I:.3f}: {sol.message}")
+
+    if np.linalg.norm(sol.fun) > 1e-6:
+        raise RuntimeError(
+            f"Solver returned inaccurate solution at I={I:.3f}. "
+            f"Residual norm = {np.linalg.norm(sol.fun):.3e}"
+        )
+
+    r = sol.x[0]
+    w_vec = sol.x[1:]
+    Y = recover_Y_from_capital(I, w_vec, r)
+
+    return Y, r, w_vec, sol.x
+
+
+# =========================================================
+# 6. Storage
+# =========================================================
+results = {
+    "I": [],
+    "Y": [],
+    "r": [],
+    "w_by_phi": {phi: [] for phi in phi_list},
+    "L_by_phi": {phi: [] for phi in phi_list},
+}
+
+# Initial guess:
+# r plus one wage for each phi-grid point
+guess = np.concatenate([
+    np.array([0.13]),
+    1.0 + 0.5 * phi_grid
+])
+
+for I in I_grid:
+    Y, r, w_vec, guess = solve_equilibrium(I, guess)
+
+    results["I"].append(I)
+    results["Y"].append(Y)
+    results["r"].append(r)
+
+    # Interpolate wages and labor at selected phi values
+    for phi in phi_list:
+        wphi = np.interp(phi, phi_grid, w_vec)
+        Lphi = labor_demand(np.array([phi]), I, Y, np.array([wphi]), r)[0]
+
+        results["w_by_phi"][phi].append(wphi)
+        results["L_by_phi"][phi].append(Lphi)
+
+
+# =========================================================
+# 7. Plot helpers
+# =========================================================
+phi_colors = {0.2: "#A8D1E7", 0.4: "#5B9BBF", 0.6: "#1C5D8A", 0.8: "#0A2B4E"}
+phi_lw     = {0.2: 1.2,       0.4: 1.2,       0.6: 1.4,       0.8: 1.6      }
+I_arr      = np.array(results["I"], dtype=float)
+
+def style_ax(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, color="lightgray", linewidth=0.7, zorder=0)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, fontsize=11)
+    plt.tight_layout()
+
+
+# =========================================================
+# 8. Plot wage curves
+# =========================================================
+fig, ax = plt.subplots(figsize=(9, 6))
+
+for phi in sorted(phi_list, reverse=True):
+    y = np.array(results["w_by_phi"][phi], dtype=float)
+    ax.plot(I_arr, y, color=phi_colors[phi], linewidth=phi_lw[phi], label=fr"$w({phi})$")
+
+ax.plot(I_arr, results["r"], color="#D97A7A", linewidth=1.5, label=r"$r$")
+
+ax.set_xlabel(r"$I$", fontsize=13)
+ax.set_xlim(0.08, 0.72)
+style_ax(ax)
+
+
+# =========================================================
+# 9. Plot labor curves
+# =========================================================
+fig, ax = plt.subplots(figsize=(9, 6))
+
+for phi in sorted(phi_list, reverse=True):
+    y = np.array(results["L_by_phi"][phi], dtype=float)
+    ax.plot(I_arr, y, color=phi_colors[phi], linewidth=phi_lw[phi], label=fr"$L({phi})$")
+
+ax.set_xlabel(r"$I$", fontsize=13)
+ax.set_ylabel(r"$L(\phi)$", fontsize=13)
+ax.set_xlim(0.08, 0.72)
+style_ax(ax)
+plt.show()
